@@ -275,7 +275,7 @@ func (c *commandSnapshotCreate) snapshotSingleSource(ctx context.Context, fsEntr
 		return errors.Wrap(err, "unable to get policy tree")
 	}
 
-	manifest, err := u.Upload(ctx, fsEntry, policyTree, sourceInfo, previous...)
+	manifest, err := u.Upload(ctx, fsEntry, rep, policyTree, sourceInfo, previous...)
 	if err != nil {
 		// fail-fast uploads will fail here without recording a manifest, other uploads will
 		// possibly fail later.

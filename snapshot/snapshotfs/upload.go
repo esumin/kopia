@@ -3,6 +3,7 @@ package snapshotfs
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -1230,11 +1232,35 @@ func (u *Uploader) maybeOpenDirectoryFromManifest(ctx context.Context, man *snap
 	return dir
 }
 
+func df() int64 {
+	fs := syscall.Statfs_t{}
+	err := syscall.Statfs("/", &fs)
+	if err != nil {
+		fmt.Println("Error getting filesystem stats:", err)
+		return 0
+	}
+
+	total := fs.Blocks * uint64(fs.Bsize)
+	free := fs.Bfree * uint64(fs.Bsize)
+	available := fs.Bavail * uint64(fs.Bsize)
+	used := total - free
+
+	fmt.Printf("Filesystem: %s\n", "/")
+	fmt.Printf("Size: %d bytes\n", total)
+	fmt.Printf("Used: %d bytes\n", used)
+	fmt.Printf("Available: %d bytes\n", available)
+	fmt.Printf("Use%%: %.2f%%\n", float64(used)/float64(total)*100)
+	fmt.Printf("Mounted on: %s\n", "/")
+
+	return int64(used)
+}
+
 // Upload uploads contents of the specified filesystem entry (file or directory) to the repository and returns snapshot.Manifest with statistics.
 // Old snapshot manifest, when provided can be used to speed up uploads by utilizing hash cache.
 func (u *Uploader) Upload(
 	ctx context.Context,
 	source fs.Entry,
+	rep repo.Repository,
 	policyTree *policy.Tree,
 	sourceInfo snapshot.SourceInfo,
 	previousManifests ...*snapshot.Manifest,
@@ -1290,11 +1316,70 @@ func (u *Uploader) Upload(
 		go func() {
 			defer scanWG.Done()
 
-			wrapped := u.wrapIgnorefs(estimateLog(ctx), entry, policyTree, false /* reportIgnoreStats */)
+			//wrapped := u.wrapIgnorefs(estimateLog(ctx), entry, policyTree, false /* reportIgnoreStats */)
 
-			ds, _ := u.scanDirectory(scanctx, wrapped, policyTree)
+			volumeTotalSize := df()
 
-			u.Progress.EstimatedDataSize(ds.numFiles, ds.totalFileSize)
+			// Keep only completed manifests
+			completedManifests := make([]*snapshot.Manifest, 0)
+			snapshots, _ := snapshot.ListSnapshots(scanctx, rep, sourceInfo)
+			for _, manifest := range snapshots {
+				if manifest.IncompleteReason != "" {
+					continue
+				}
+
+				completedManifests = append(completedManifests, manifest)
+			}
+
+			// Sort them by time
+			manifests := snapshot.SortByTime(completedManifests, true)
+
+			// Keep only three last manifests
+			if len(manifests) > 3 {
+				manifests = manifests[:3]
+			}
+
+			estimatedTotalFileSize := int64(0)
+			if len(manifests) > 0 {
+				estimatedTotalFileSize = manifests[0].Stats.TotalFileSize
+				if len(manifests) >= 2 {
+					deltas := make([]int64, len(manifests)-1)
+					lastTotalFileSize := estimatedTotalFileSize
+					for idx, snapshot := range manifests {
+						if idx == 0 {
+							continue
+						}
+
+						deltas[idx-1] = lastTotalFileSize - snapshot.Stats.TotalFileSize
+						lastTotalFileSize = snapshot.Stats.TotalFileSize
+					}
+
+					// Calculate average delta
+					avg := int64(0)
+					for _, delta := range deltas {
+						avg += delta
+					}
+					avg = int64(float64(avg) / float64(len(deltas)))
+					estimatedTotalFileSize += avg
+				}
+			}
+
+			fmt.Printf("Total volume size: %v, Estimated total size: %v\n", volumeTotalSize, estimatedTotalFileSize)
+			//estimatedTotalFileSize = int64(math.Max(float64(volumeTotalSize), float64(estimatedTotalFileSize)))
+			fmt.Printf("Setting final estimation size: %v\n", estimatedTotalFileSize)
+
+			for _, snapshot := range manifests {
+				fmt.Printf("snapshot: [%v], %v = %v\n", snapshot.ID, snapshot.StartTime.Format(time.RFC3339), snapshot.Stats.TotalFileSize)
+				//fmt.Printf("%v\n", snapshot)
+			}
+
+			u.Progress.EstimatedDataSize(1, estimatedTotalFileSize)
+			//ds, _ := u.scanDirectory(scanctx, wrapped, policyTree)
+			//fmt.Println("Sleep 10s")
+			//time.Sleep(10 * time.Second)
+			//fmt.Println("Wake up")
+			//
+			//u.Progress.EstimatedDataSize(ds.numFiles, ds.totalFileSize)
 		}()
 
 		wrapped := u.wrapIgnorefs(uploadLog(ctx), entry, policyTree, true /* reportIgnoreStats */)
